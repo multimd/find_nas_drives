@@ -427,16 +427,187 @@ def ping_host(ip, timeout=0.5):
     except (subprocess.SubprocessError, subprocess.TimeoutExpired):
         return False
 
+def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
+    """
+    Try multiple methods to get a meaningful device name.
+    Returns a tuple of (name, name_source) where name_source indicates how the name was found.
+    """
+    # For SMB/NetBIOS devices, try extra hard to get device info
+    # This is especially useful for NAS devices
+    if is_likely_nas_ip(ip):
+        # Try multiple methods with slightly longer timeouts
+        timeout_nas = min(timeout * 2, 1.0)  # Don't wait too long, but give more time
+    else:
+        timeout_nas = timeout
+    
+    # First try standard DNS resolution (fastest)
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        if hostname and hostname != ip:
+            return (hostname, "DNS")
+    except (socket.herror, socket.gaierror):
+        pass
+    
+    # For Linux, try avahi/mDNS if available
+    if is_linux():
+        try:
+            # Try avahi-resolve if available (mDNS resolution)
+            avahi_output = subprocess.check_output(
+                ['avahi-resolve', '-a', ip], 
+                stderr=subprocess.DEVNULL, 
+                timeout=timeout_nas
+            ).decode('utf-8').strip()
+            
+            if avahi_output and ip in avahi_output:
+                # Extract hostname from output (format is typically "ip hostname")
+                parts = avahi_output.split()
+                if len(parts) >= 2:
+                    return (parts[1], "mDNS")
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+    
+    # For macOS, try using dns-sd for mDNS lookup
+    if is_macos():
+        try:
+            # Reverse DNS with dns-sd (mDNS on macOS)
+            dns_sd_output = subprocess.check_output(
+                ['dns-sd', '-Q', ip, '-timeout', '1'],
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_nas+1
+            ).decode('utf-8')
+            
+            # Parse the output for hostnames
+            matches = re.findall(r'can be reached at ([^:]+)\.local', dns_sd_output)
+            if matches:
+                return (f"{matches[0]}.local", "mDNS")
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+            pass
+    
+    # Try NetBIOS name resolution for Windows/SMB devices
+    try:
+        # Use nmblookup on Linux or nbtscan if available
+        if is_linux():
+            try:
+                # First try nmblookup (part of Samba)
+                nmb_output = subprocess.check_output(
+                    ['nmblookup', '-A', ip],
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_nas
+                ).decode('utf-8')
+                
+                # Look for NetBIOS name
+                match = re.search(r'<00> B <ACTIVE>\s+([^\s]+)', nmb_output)
+                if match:
+                    return (match.group(1), "NetBIOS")
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # Try nbtscan as fallback
+                try:
+                    nbt_output = subprocess.check_output(
+                        ['nbtscan', ip],
+                        stderr=subprocess.DEVNULL,
+                        timeout=timeout_nas
+                    ).decode('utf-8')
+                    
+                    match = re.search(ip + r'\s+([^\s]+)', nbt_output)
+                    if match:
+                        return (match.group(1), "NetBIOS")
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass
+        
+        # On macOS, we might have to install nbtscan or equivalent
+        # But we can try a basic SMB connection to get info
+        if is_macos():
+            # First try the smbutil lookup command
+            try:
+                # Use smbutil to get NetBIOS name on macOS
+                smb_output = subprocess.check_output(
+                    ['smbutil', 'lookup', ip],
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_nas
+                ).decode('utf-8')
+                
+                # Parse output for server name
+                match = re.search(r'server name: ([^\s]+)', smb_output, re.IGNORECASE)
+                if match:
+                    return (match.group(1), "SMB-lookup")
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+            
+            # Then try smbutil view which might work better with NAS devices
+            try:
+                view_cmd = ['smbutil', 'view', f'//{ip}']
+                smb_view_output = subprocess.check_output(
+                    view_cmd,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout_nas
+                ).decode('utf-8')
+                
+                # Parse the output for the server name
+                lines = smb_view_output.splitlines()
+                if lines and len(lines) > 0:
+                    # The first line often contains server info
+                    server_line = lines[0]
+                    match = re.search(r'Server: (.+?)$', server_line)
+                    if match and match.group(1) != ip:
+                        return (match.group(1), "SMB-view")
+                
+                    # Try another pattern sometimes seen
+                    for line in lines:
+                        if "WORKGROUP" in line or "Domain:" in line:
+                            parts = line.split()
+                            if len(parts) > 1 and parts[1] != ip:
+                                return (parts[1], "SMB-domain")
+            except (subprocess.SubprocessError, FileNotFoundError):
+                pass
+    except Exception as e:
+        # Silently handle any errors in name resolution
+        pass
+    
+    # Try SNMP for device name if possible (requires net-snmp tools)
+    try:
+        # This will only work if snmpget is installed and device has SNMP enabled with default community
+        snmp_output = subprocess.check_output(
+            ['snmpget', '-v', '2c', '-c', 'public', '-t', str(timeout_nas), '-r', '1', ip, '1.3.6.1.2.1.1.5.0'],
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_nas
+        ).decode('utf-8')
+        
+        # Parse output for system name
+        match = re.search(r'STRING: ([^\s"]+)', snmp_output)
+        if match:
+            return (match.group(1), "SNMP")
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    
+    # Final attempt: if it's port 445 is open, try to get SMB info directly
+    # using a raw socket (this doesn't require external tools)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout_nas)
+        if sock.connect_ex((ip, 445)) == 0:
+            # We could implement a basic SMB protocol negotiation here
+            # to get the server name, but that's quite complex
+            # For now, we'll just indicate that it's an SMB server
+            sock.close()
+            return (ip, "SMB-Device")
+    except:
+        pass
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
+    
+    # If we reach here, we couldn't find a name
+    return (ip, "IP")
+
 def scan_for_nas(ip, ports=DEFAULT_PORTS, timeout=DEFAULT_TIMEOUT):
     """
     Scan an IP address for common NAS ports
     Optimized version with reduced timeout and early termination
     """
     # Create a hostname from the IP
-    try:
-        hostname = socket.gethostbyaddr(ip)[0]
-    except (socket.herror, socket.gaierror):
-        hostname = ip
+    device_name, name_source = get_device_name(ip, timeout)
     
     # Test TCP ports - optimized to check most common ports first
     # Sort ports by likelihood of being a NAS service
@@ -489,7 +660,8 @@ def scan_for_nas(ip, ports=DEFAULT_PORTS, timeout=DEFAULT_TIMEOUT):
     return {
         'type': 'discovered',
         'ip': ip,
-        'hostname': hostname,
+        'hostname': device_name,
+        'name_source': name_source,
         'open_ports': open_ports,
         'services': detected_services
     }
@@ -507,6 +679,7 @@ def format_single_drive(drive, index=None, colorize=False):
     BLUE = '\033[94m' if colorize else ''
     BOLD = '\033[1m' if colorize else ''
     CYAN = '\033[96m' if colorize else ''  # Added cyan color for variety
+    MAGENTA = '\033[95m' if colorize else ''  # Added magenta for device names
     UNDERLINE = '\033[4m' if colorize else ''  # Added underline for emphasis
     END = '\033[0m' if colorize else ''
     
@@ -523,7 +696,16 @@ def format_single_drive(drive, index=None, colorize=False):
             output.append(f"{BOLD}{index}. IP:       {YELLOW}{drive['ip']}{END}")
         else:
             output.append(f"{BOLD}IP:       {YELLOW}{drive['ip']}{END}")
-        output.append(f"{BOLD}   Hostname: {BLUE}{drive['hostname']}{END}")
+        
+        # Add device name if we found one different from the IP
+        if 'hostname' in drive and drive['hostname'] != drive['ip']:
+            output.append(f"{BOLD}   Name:     {MAGENTA}{drive['hostname']}{END} {GREEN}({drive.get('name_source', 'DNS')}){END}")
+        else:
+            # If using name resolution debugging
+            if 'name_source' in drive:
+                output.append(f"{BOLD}   Name:     {YELLOW}Unknown {GREEN}(attempted {drive.get('name_source', 'DNS')}){END}")
+            
+        # Only show services line
         output.append(f"{BOLD}   Services: {GREEN}{', '.join(drive['services'])}{END}")
     
     return "\n".join(output)
@@ -707,14 +889,6 @@ def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=
                     if sound_alert:
                         print('\a', end='', flush=True)
                     
-                    # Print notification banner for new device - make it more prominent
-                    if use_color:
-                        # Create a more eye-catching banner with alternating colors
-                        print("\033[97;44m" + "!" * 20 + " NEW NAS DEVICE FOUND! " + "!" * 20 + "\033[0m")
-                    else:
-                        print("!" * 80)
-                        print("!" * 30 + " NEW NAS DEVICE FOUND! " + "!" * 30)
-                        print("!" * 80)
                     
                     # Print the new device with color highlighting
                     devices_found += 1
