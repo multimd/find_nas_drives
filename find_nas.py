@@ -15,20 +15,45 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import argparse
 from functools import lru_cache
+import logging
+from zeroconf import Zeroconf, ServiceBrowser, ServiceStateChange
+import threading
+import contextlib
+from nmb.NetBIOS import NetBIOS
+from smb.SMBConnection import SMBConnection
 
 # Constants for scanning
 DEFAULT_TIMEOUT = 0.2  # Reduced from 0.5s to 0.2s for faster scanning
 DEFAULT_THREADS = 50   # Increased from 20 to 50 for better parallelization
 DEFAULT_PORTS = [445, 139, 111, 2049, 548]  # Common NAS ports
-COMMON_NAS_MAC_PREFIXES = [
+
+# Common NAS vendor MAC address prefixes
+NAS_MAC_PREFIXES = [
+    '00:10:75',  # Synology
     '00:11:32',  # Synology
+    '00:24:8C',  # QNAP
+    '24:5E:BE',  # QNAP
+    'E0:37:17',  # QNAP
+    '00:1B:A9',  # Western Digital
     '00:90:A9',  # Western Digital
-    '00:24:21',  # QNAP
-    '00:1B:A9',  # Asustor
-    '00:14:6C',  # Netgear ReadyNAS
-    '00:25:31',  # TerraMaster
+    '00:14:EE',  # Western Digital
+    '00:0C:29',  # VMware (for NAS VMs)
+    '00:50:56',  # VMware (for NAS VMs)
     '00:50:43',  # Buffalo
 ]
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger('find_nas')
+# Set to WARNING to suppress most logs by default
+logger.setLevel(logging.WARNING)
+
+# Global cache for device names to avoid redundant lookups
+DEVICE_NAME_CACHE = {}
 
 def is_macos():
     """Check if running on macOS"""
@@ -39,73 +64,8 @@ def is_linux():
     return platform.system() == 'Linux'
 
 def get_mounted_nas_drives():
-    """
-    Find all mounted NAS drives using mount command
-    Works on both macOS and Ubuntu/Linux
-    """
-    result = []
-    try:
-        # Run the mount command to list all mounted filesystems
-        mount_output = subprocess.check_output(['mount']).decode('utf-8')
-        
-        # Look for network filesystems
-        for line in mount_output.splitlines():
-            # For Linux CIFS/SMB mounts
-            if is_linux() and ('cifs' in line or 'smbfs' in line):
-                # Extract server and mount point information for Linux
-                match = re.search(r'//([^/]+)/([^ ]+) on ([^ ]+) type (cifs|smbfs)', line)
-                if match:
-                    server, share, mount_point, fs_type = match.groups()
-                    result.append({
-                        'type': 'mounted',
-                        'protocol': fs_type,
-                        'server': server,
-                        'share': share,
-                        'mount_point': mount_point
-                    })
-            
-            # For Linux NFS mounts
-            elif is_linux() and 'nfs' in line:
-                match = re.search(r'([^:]+):([^ ]+) on ([^ ]+) type nfs', line)
-                if match:
-                    server, share, mount_point = match.groups()
-                    result.append({
-                        'type': 'mounted',
-                        'protocol': 'nfs',
-                        'server': server,
-                        'share': share,
-                        'mount_point': mount_point
-                    })
-            
-            # For macOS mounts
-            elif is_macos() and any(fs_type in line for fs_type in ['nfs', 'smbfs', 'cifs', 'afp']):
-                # Extract server and mount point information for macOS
-                match = re.search(r'//([^/]+)/([^ ]+) on ([^ ]+)', line)
-                if match:
-                    server, share, mount_point = match.groups()
-                    result.append({
-                        'type': 'mounted',
-                        'protocol': next((fs for fs in ['nfs', 'smbfs', 'cifs', 'afp'] if fs in line), 'unknown'),
-                        'server': server,
-                        'share': share,
-                        'mount_point': mount_point
-                    })
-                else:
-                    # For other formats like NFS on macOS
-                    match = re.search(r'([^:]+):([^ ]+) on ([^ ]+)', line)
-                    if match:
-                        server, share, mount_point = match.groups()
-                        result.append({
-                            'type': 'mounted',
-                            'protocol': 'nfs',
-                            'server': server,
-                            'share': share,
-                            'mount_point': mount_point
-                        })
-    except Exception as e:
-        print(f"Error getting mounted NAS drives: {e}", file=sys.stderr)
-    
-    return result
+    """Get mounted NAS drives on the system."""
+    return find_mounted_drives()
 
 @lru_cache(maxsize=8)
 def get_local_network_info():
@@ -267,28 +227,36 @@ def get_local_network_info():
         }
 
 def is_likely_nas_ip(ip):
-    """
-    Heuristic to determine if an IP is likely to be a NAS device
-    based on common NAS IP patterns
-    """
-    # Common NAS IP patterns:
-    # - Often ends with low numbers (1-20)
-    # - Often in reserved ranges for servers
-    # - Avoid common router/gateway IPs
-
-    ip_obj = ipaddress.IPv4Address(ip)
-    ip_parts = str(ip).split('.')
-    last_octet = int(ip_parts[-1])
+    """Determine if an IP is likely to be a NAS based on various heuristics."""
+    # Check against common NAS vendor MAC prefixes
+    # Note: This will only work if the MAC is already in the ARP table
+    try:
+        # Get MAC address via ARP
+        if is_macos():
+            arp_output = subprocess.check_output(['arp', '-n', ip], stderr=subprocess.DEVNULL).decode('utf-8')
+            mac_match = re.search(r'([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})', arp_output)
+            if mac_match:
+                mac = mac_match.group(1).lower()
+                # Check against known NAS vendor MAC prefixes
+                for prefix in NAS_MAC_PREFIXES:
+                    if mac.startswith(prefix.lower().replace('-', ':')):
+                        return True
+        elif is_linux():
+            # Get MAC address from ip neighbor
+            ip_neigh_output = subprocess.check_output(['ip', 'neighbor', 'show', ip], 
+                                                     stderr=subprocess.DEVNULL).decode('utf-8')
+            mac_match = re.search(r'([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})', ip_neigh_output)
+            if mac_match:
+                mac = mac_match.group(1).lower()
+                # Check against known NAS vendor MAC prefixes
+                for prefix in NAS_MAC_PREFIXES:
+                    if mac.startswith(prefix.lower().replace('-', ':')):
+                        return True
+    except:
+        pass
     
-    # Skip gateway-like IPs (often end in .1, .254)
-    if last_octet == 1 or last_octet == 254:
-        return False
-    
-    # Higher priority for IPs that are likely to be servers (10-30, 100-200)
-    if (10 <= last_octet <= 30) or (100 <= last_octet <= 200):
-        return True
-    
-    return None  # Neutral priority
+    # Could add more heuristics here
+    return False
 
 def find_active_hosts(subnet, max_hosts=254):
     """
@@ -318,7 +286,7 @@ def find_active_hosts(subnet, max_hosts=254):
                         # Check if IP is in our target subnet
                         if ip_obj in subnet_obj:
                             # Check if MAC prefix matches known NAS vendors
-                            is_known_nas = any(mac.lower().startswith(prefix.lower()) for prefix in COMMON_NAS_MAC_PREFIXES)
+                            is_known_nas = any(mac.lower().startswith(prefix.lower()) for prefix in NAS_MAC_PREFIXES)
                             
                             active_hosts.append({
                                 'ip': ip, 
@@ -347,7 +315,7 @@ def find_active_hosts(subnet, max_hosts=254):
                     # Check if IP is in our target subnet
                     if ip_obj in subnet_obj:
                         # Check if MAC prefix matches known NAS vendors
-                        is_known_nas = any(mac.lower().startswith(prefix.lower()) for prefix in COMMON_NAS_MAC_PREFIXES)
+                        is_known_nas = any(mac.lower().startswith(prefix.lower()) for prefix in NAS_MAC_PREFIXES)
                         
                         active_hosts.append({
                             'ip': ip, 
@@ -427,11 +395,28 @@ def ping_host(ip, timeout=0.5):
     except (subprocess.SubprocessError, subprocess.TimeoutExpired):
         return False
 
-def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
+@lru_cache(maxsize=256)
+def get_device_name(ip, timeout=DEFAULT_TIMEOUT, debug=False):
     """
     Try multiple methods to get a meaningful device name.
     Returns a tuple of (name, name_source) where name_source indicates how the name was found.
+    
+    Enhanced with:
+    - Zeroconf for mDNS resolution
+    - NetBIOS via pysmb
+    - SMB via pysmb
+    - Better error handling and detailed logging
+    - Results caching
     """
+    # Enable debugging if requested
+    if debug:
+        logger.setLevel(logging.DEBUG)
+    
+    # Check cache first
+    if ip in DEVICE_NAME_CACHE:
+        logger.debug(f"Using cached name for {ip}: {DEVICE_NAME_CACHE[ip]}")
+        return DEVICE_NAME_CACHE[ip]
+        
     # For SMB/NetBIOS devices, try extra hard to get device info
     # This is especially useful for NAS devices
     if is_likely_nas_ip(ip):
@@ -442,15 +427,104 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
     
     # First try standard DNS resolution (fastest)
     try:
+        logger.debug(f"Attempting DNS resolution for {ip}")
         hostname = socket.gethostbyaddr(ip)[0]
         if hostname and hostname != ip:
-            return (hostname, "DNS")
-    except (socket.herror, socket.gaierror):
-        pass
+            logger.debug(f"DNS resolution succeeded for {ip}: {hostname}")
+            result = (hostname, "DNS")
+            DEVICE_NAME_CACHE[ip] = result
+            return result
+    except (socket.herror, socket.gaierror) as e:
+        logger.debug(f"DNS resolution failed for {ip}: {e}")
+    
+    # Try mDNS resolution using zeroconf
+    try:
+        logger.debug(f"Attempting mDNS resolution for {ip}")
+        # Create a new event to signal when we've found a name
+        found_event = threading.Event()
+        mdns_name = [None]
+        
+        # Define listener callback
+        def on_service_state_change(zeroconf, service_type, name, state_change=None, state=None):
+            # Handle both old and new zeroconf API versions
+            actual_state = state_change if state_change is not None else state
+            if actual_state == ServiceStateChange.Added:
+                info = zeroconf.get_service_info(service_type, name)
+                if info and info.addresses:
+                    for address in info.addresses:
+                        addr = socket.inet_ntoa(address)
+                        if addr == ip:
+                            mdns_name[0] = name.split('.')[0]  # Get the first part of the name
+                            found_event.set()
+        
+        # Services to look for (common NAS services)
+        service_types = [
+            "_smb._tcp.local.",
+            "_afpovertcp._tcp.local.",
+            "_nfs._tcp.local.",
+            "_http._tcp.local.",
+            "_https._tcp.local.",
+        ]
+        
+        # Use zeroconf to browse for services
+        zeroconf = Zeroconf()
+        browsers = []
+        
+        try:
+            for service_type in service_types:
+                browsers.append(ServiceBrowser(zeroconf, service_type, handlers=[on_service_state_change]))
+            
+            # Wait for a short time to find the device
+            found_event.wait(timeout_nas)
+            
+            if mdns_name[0]:
+                logger.debug(f"mDNS resolution succeeded for {ip}: {mdns_name[0]}")
+                result = (mdns_name[0], "mDNS-Zeroconf")
+                DEVICE_NAME_CACHE[ip] = result
+                return result
+        finally:
+            zeroconf.close()
+    except Exception as e:
+        logger.debug(f"mDNS resolution failed for {ip}: {e}")
+    
+    # Try NetBIOS name lookup using pysmb
+    try:
+        logger.debug(f"Attempting NetBIOS resolution for {ip}")
+        netbios = NetBIOS()
+        names = netbios.queryIPForName(ip, timeout=timeout_nas)
+        if names and names[0]:
+            logger.debug(f"NetBIOS resolution succeeded for {ip}: {names[0]}")
+            result = (names[0], "NetBIOS-pysmb")
+            DEVICE_NAME_CACHE[ip] = result
+            return result
+    except Exception as e:
+        logger.debug(f"NetBIOS resolution failed for {ip}: {e}")
+    
+    # Try SMB connection for server information
+    try:
+        logger.debug(f"Attempting SMB connection to {ip}")
+        # Create an SMB connection (no credentials, just checking the server name)
+        conn = SMBConnection('', '', 'finder', '', use_ntlm_v2=True)
+        
+        # Try to connect with a short timeout
+        with socket.socket() as s:
+            s.settimeout(timeout_nas)
+            if conn.connect(ip, 445, timeout=timeout_nas):
+                server_name = conn.remote_name
+                if server_name and server_name != ip:
+                    logger.debug(f"SMB resolution succeeded for {ip}: {server_name}")
+                    result = (server_name, "SMB-pysmb")
+                    DEVICE_NAME_CACHE[ip] = result
+                    return result
+    except Exception as e:
+        logger.debug(f"SMB resolution failed for {ip}: {e}")
+    
+    # Fallback to traditional command line methods if Python libraries fail
     
     # For Linux, try avahi/mDNS if available
     if is_linux():
         try:
+            logger.debug(f"Attempting avahi-resolve for {ip}")
             # Try avahi-resolve if available (mDNS resolution)
             avahi_output = subprocess.check_output(
                 ['avahi-resolve', '-a', ip], 
@@ -462,13 +536,18 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
                 # Extract hostname from output (format is typically "ip hostname")
                 parts = avahi_output.split()
                 if len(parts) >= 2:
-                    return (parts[1], "mDNS")
-        except (subprocess.SubprocessError, FileNotFoundError):
-            pass
+                    hostname = parts[1]
+                    logger.debug(f"avahi-resolve succeeded for {ip}: {hostname}")
+                    result = (hostname, "mDNS-avahi")
+                    DEVICE_NAME_CACHE[ip] = result
+                    return result
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            logger.debug(f"avahi-resolve failed for {ip}: {e}")
     
     # For macOS, try using dns-sd for mDNS lookup
     if is_macos():
         try:
+            logger.debug(f"Attempting dns-sd for {ip}")
             # Reverse DNS with dns-sd (mDNS on macOS)
             dns_sd_output = subprocess.check_output(
                 ['dns-sd', '-Q', ip, '-timeout', '1'],
@@ -479,12 +558,19 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
             # Parse the output for hostnames
             matches = re.findall(r'can be reached at ([^:]+)\.local', dns_sd_output)
             if matches:
-                return (f"{matches[0]}.local", "mDNS")
-        except (subprocess.SubprocessError, subprocess.TimeoutExpired):
-            pass
+                hostname = f"{matches[0]}.local"
+                logger.debug(f"dns-sd succeeded for {ip}: {hostname}")
+                result = (hostname, "mDNS-dns-sd")
+                DEVICE_NAME_CACHE[ip] = result
+                return result
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired) as e:
+            logger.debug(f"dns-sd failed for {ip}: {e}")
     
-    # Try NetBIOS name resolution for Windows/SMB devices
+    # Fallback to legacy methods only if the newer methods fail
+    
+    # Try NetBIOS name resolution (legacy methods)
     try:
+        logger.debug(f"Attempting legacy NetBIOS methods for {ip}")
         # Use nmblookup on Linux or nbtscan if available
         if is_linux():
             try:
@@ -498,8 +584,13 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
                 # Look for NetBIOS name
                 match = re.search(r'<00> B <ACTIVE>\s+([^\s]+)', nmb_output)
                 if match:
-                    return (match.group(1), "NetBIOS")
-            except (subprocess.SubprocessError, FileNotFoundError):
+                    hostname = match.group(1)
+                    logger.debug(f"nmblookup succeeded for {ip}: {hostname}")
+                    result = (hostname, "NetBIOS-nmblookup")
+                    DEVICE_NAME_CACHE[ip] = result
+                    return result
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                logger.debug(f"nmblookup failed for {ip}: {e}")
                 # Try nbtscan as fallback
                 try:
                     nbt_output = subprocess.check_output(
@@ -510,15 +601,19 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
                     
                     match = re.search(ip + r'\s+([^\s]+)', nbt_output)
                     if match:
-                        return (match.group(1), "NetBIOS")
-                except (subprocess.SubprocessError, FileNotFoundError):
-                    pass
+                        hostname = match.group(1)
+                        logger.debug(f"nbtscan succeeded for {ip}: {hostname}")
+                        result = (hostname, "NetBIOS-nbtscan")
+                        DEVICE_NAME_CACHE[ip] = result
+                        return result
+                except (subprocess.SubprocessError, FileNotFoundError) as e:
+                    logger.debug(f"nbtscan failed for {ip}: {e}")
         
-        # On macOS, we might have to install nbtscan or equivalent
-        # But we can try a basic SMB connection to get info
+        # On macOS, try smbutil commands
         if is_macos():
             # First try the smbutil lookup command
             try:
+                logger.debug(f"Attempting smbutil lookup for {ip}")
                 # Use smbutil to get NetBIOS name on macOS
                 smb_output = subprocess.check_output(
                     ['smbutil', 'lookup', ip],
@@ -529,12 +624,17 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
                 # Parse output for server name
                 match = re.search(r'server name: ([^\s]+)', smb_output, re.IGNORECASE)
                 if match:
-                    return (match.group(1), "SMB-lookup")
-            except (subprocess.SubprocessError, FileNotFoundError):
-                pass
+                    hostname = match.group(1)
+                    logger.debug(f"smbutil lookup succeeded for {ip}: {hostname}")
+                    result = (hostname, "SMB-lookup")
+                    DEVICE_NAME_CACHE[ip] = result
+                    return result
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                logger.debug(f"smbutil lookup failed for {ip}: {e}")
             
-            # Then try smbutil view which might work better with NAS devices
+            # Then try smbutil view
             try:
+                logger.debug(f"Attempting smbutil view for {ip}")
                 view_cmd = ['smbutil', 'view', f'//{ip}']
                 smb_view_output = subprocess.check_output(
                     view_cmd,
@@ -549,22 +649,31 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
                     server_line = lines[0]
                     match = re.search(r'Server: (.+?)$', server_line)
                     if match and match.group(1) != ip:
-                        return (match.group(1), "SMB-view")
+                        hostname = match.group(1)
+                        logger.debug(f"smbutil view succeeded for {ip}: {hostname}")
+                        result = (hostname, "SMB-view")
+                        DEVICE_NAME_CACHE[ip] = result
+                        return result
                 
                     # Try another pattern sometimes seen
                     for line in lines:
                         if "WORKGROUP" in line or "Domain:" in line:
                             parts = line.split()
                             if len(parts) > 1 and parts[1] != ip:
-                                return (parts[1], "SMB-domain")
-            except (subprocess.SubprocessError, FileNotFoundError):
-                pass
+                                hostname = parts[1]
+                                logger.debug(f"smbutil view (domain) succeeded for {ip}: {hostname}")
+                                result = (hostname, "SMB-domain")
+                                DEVICE_NAME_CACHE[ip] = result
+                                return result
+            except (subprocess.SubprocessError, FileNotFoundError) as e:
+                logger.debug(f"smbutil view failed for {ip}: {e}")
     except Exception as e:
-        # Silently handle any errors in name resolution
-        pass
+        # Handle any unexpected errors in the whole NetBIOS block
+        logger.debug(f"All NetBIOS/SMB methods failed for {ip}: {e}")
     
-    # Try SNMP for device name if possible (requires net-snmp tools)
+    # Try SNMP for device name if possible
     try:
+        logger.debug(f"Attempting SNMP query for {ip}")
         # This will only work if snmpget is installed and device has SNMP enabled with default community
         snmp_output = subprocess.check_output(
             ['snmpget', '-v', '2c', '-c', 'public', '-t', str(timeout_nas), '-r', '1', ip, '1.3.6.1.2.1.1.5.0'],
@@ -575,171 +684,148 @@ def get_device_name(ip, timeout=DEFAULT_TIMEOUT):
         # Parse output for system name
         match = re.search(r'STRING: ([^\s"]+)', snmp_output)
         if match:
-            return (match.group(1), "SNMP")
-    except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+            hostname = match.group(1)
+            logger.debug(f"SNMP query succeeded for {ip}: {hostname}")
+            result = (hostname, "SNMP")
+            DEVICE_NAME_CACHE[ip] = result
+            return result
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        logger.debug(f"SNMP query failed for {ip}: {e}")
     
-    # Final attempt: if it's port 445 is open, try to get SMB info directly
-    # using a raw socket (this doesn't require external tools)
+    # Final check: if it's port 445 is open, try to get SMB info directly
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout_nas)
-        if sock.connect_ex((ip, 445)) == 0:
-            # We could implement a basic SMB protocol negotiation here
-            # to get the server name, but that's quite complex
-            # For now, we'll just indicate that it's an SMB server
-            sock.close()
-            return (ip, "SMB-Device")
-    except:
-        pass
-    finally:
-        try:
-            sock.close()
-        except:
-            pass
+        logger.debug(f"Final check: Testing if {ip} has SMB port open")
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            sock.settimeout(timeout_nas)
+            if sock.connect_ex((ip, 445)) == 0:
+                # We know it's an SMB server but couldn't get its name
+                logger.debug(f"Confirmed {ip} is an SMB server, but couldn't get name")
+                result = (ip, "SMB-Device")
+                DEVICE_NAME_CACHE[ip] = result
+                return result
+    except Exception as e:
+        logger.debug(f"Final SMB socket check failed for {ip}: {e}")
     
     # If we reach here, we couldn't find a name
-    return (ip, "IP")
+    logger.debug(f"All name resolution methods failed for {ip}")
+    result = (ip, "IP")
+    DEVICE_NAME_CACHE[ip] = result
+    return result
 
 def scan_for_nas(ip, ports=DEFAULT_PORTS, timeout=DEFAULT_TIMEOUT):
-    """
-    Scan an IP address for common NAS ports
-    Optimized version with reduced timeout and early termination
-    """
-    # Create a hostname from the IP
-    device_name, name_source = get_device_name(ip, timeout)
+    """Scan an IP address for NAS services."""
+    services = []
     
-    # Test TCP ports - optimized to check most common ports first
-    # Sort ports by likelihood of being a NAS service
-    # SMB is most common for NAS, followed by NFS
-    sorted_ports = sorted(ports, key=lambda p: (p != 445, p != 2049, p))
+    # Common NAS service ports:
+    # 445 - SMB
+    # 139 - NetBIOS/SMB
+    # 111 - NFS portmapper
+    # 2049 - NFS
+    # 548 - AFP
     
-    open_ports = []
-    
-    # Early stop condition - if we detect a clear NAS signature, stop scanning
-    smb_detected = False
-    nfs_detected = False
-    
-    for port in sorted_ports:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        
-        try:
-            if sock.connect_ex((ip, port)) == 0:
-                open_ports.append(port)
-                
-                # Check if we've found obvious NAS services
-                if port == 445 or port == 139:
-                    smb_detected = True
-                elif port == 2049 or port == 111:
-                    nfs_detected = True
-                
-                # Early termination if we have clear evidence of NAS
-                if smb_detected and nfs_detected and len(open_ports) >= 3:
-                    break
-        except:
-            pass
-        finally:
+    try:
+        for port in ports:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
             sock.close()
-    
-    # If no open ports, return None
-    if not open_ports:
-        return None
-    
-    # Map ports to services
-    services = {
-        445: 'SMB',
-        139: 'NetBIOS/SMB',
-        111: 'NFS Portmapper',
-        2049: 'NFS',
-        548: 'AFP'
-    }
-    
-    detected_services = [services.get(port, f"Unknown ({port})") for port in open_ports]
-    
-    return {
-        'type': 'discovered',
-        'ip': ip,
-        'hostname': device_name,
-        'name_source': name_source,
-        'open_ports': open_ports,
-        'services': detected_services
-    }
-
-def format_single_drive(drive, index=None, colorize=False):
-    """
-    Format a single NAS drive for display
-    With optional colorization for terminal output
-    """
-    output = []
-    
-    # ANSI color codes for terminal output
-    GREEN = '\033[92m' if colorize else ''
-    YELLOW = '\033[93m' if colorize else ''
-    BLUE = '\033[94m' if colorize else ''
-    BOLD = '\033[1m' if colorize else ''
-    CYAN = '\033[96m' if colorize else ''  # Added cyan color for variety
-    MAGENTA = '\033[95m' if colorize else ''  # Added magenta for device names
-    UNDERLINE = '\033[4m' if colorize else ''  # Added underline for emphasis
-    END = '\033[0m' if colorize else ''
-    
-    if drive['type'] == 'mounted':
-        if index is not None:
-            output.append(f"{BOLD}{index}. Protocol: {GREEN}{drive['protocol'].upper()}{END}")
-        else:
-            output.append(f"{BOLD}Protocol: {GREEN}{drive['protocol'].upper()}{END}")
-        output.append(f"{BOLD}   Server:   {BLUE}{drive['server']}{END}")
-        output.append(f"{BOLD}   Share:    {drive['share']}{END}")
-        output.append(f"{BOLD}   Mounted:  {drive['mount_point']}{END}")
-    else:  # discovered
-        if index is not None:
-            output.append(f"{BOLD}{index}. IP:       {YELLOW}{drive['ip']}{END}")
-        else:
-            output.append(f"{BOLD}IP:       {YELLOW}{drive['ip']}{END}")
-        
-        # Add device name if we found one different from the IP
-        if 'hostname' in drive and drive['hostname'] != drive['ip']:
-            output.append(f"{BOLD}   Name:     {MAGENTA}{drive['hostname']}{END} {GREEN}({drive.get('name_source', 'DNS')}){END}")
-        else:
-            # If using name resolution debugging
-            if 'name_source' in drive:
-                output.append(f"{BOLD}   Name:     {YELLOW}Unknown {GREEN}(attempted {drive.get('name_source', 'DNS')}){END}")
             
-        # Only show services line
-        output.append(f"{BOLD}   Services: {GREEN}{', '.join(drive['services'])}{END}")
+            if result == 0:
+                if port == 445:
+                    services.append("SMB")
+                elif port == 139:
+                    services.append("NetBIOS/SMB")
+                elif port == 111 or port == 2049:
+                    services.append("NFS")
+                elif port == 548:
+                    services.append("AFP")
+                else:
+                    services.append(f"Port {port}")
+    except Exception as e:
+        pass  # Ignore errors like refused connections, timeouts, etc.
     
-    return "\n".join(output)
+    if services:
+        # Only try to identify the hostname/device name if we have services
+        # This will use the enhanced resolution that attempts multiple methods
+        name_info = get_device_name(ip, timeout=timeout, debug=logger.level <= logging.DEBUG)
+        device_name = name_info[0]
+        name_source = name_info[1]
+        
+        return {
+            'ip': ip,
+            'name': device_name,
+            'name_source': name_source,
+            'services': services
+        }
+    
+    return None
+
+def format_single_drive(drive, use_color=True):
+    """Format a single drive for display"""
+    
+    # ANSI color codes
+    if use_color:
+        GREEN = '\033[92m'
+        YELLOW = '\033[93m'
+        BLUE = '\033[94m'
+        CYAN = '\033[96m'
+        BOLD = '\033[1m'
+        END = '\033[0m'
+    else:
+        GREEN = YELLOW = BLUE = CYAN = BOLD = END = ''
+    
+    if drive.get('mounted'):
+        output = [f"{BOLD}{GREEN}Mounted Drive:{END}"]
+        output.append(f"  Protocol: {drive['protocol']}")
+        output.append(f"  Server:   {drive['server']}")
+        output.append(f"  Share:    {drive['share']}")
+        output.append(f"  Mounted:  {drive['mountpoint']}")
+    else:
+        output = [f"{BOLD}{YELLOW}NAS Device:{END}"]
+        
+        # Handle the name display
+        device_name = drive['name']
+        name_source = drive.get('name_source', 'Unknown')
+        
+        if device_name != drive['ip']:
+            if name_source != "IP":
+                # We have a real device name
+                output.append(f"  Name:     {CYAN}{device_name}{END} ({name_source})")
+            else:
+                # Just IP address
+                output.append(f"  IP:       {drive['ip']}")
+        else:
+            # Just IP address
+            output.append(f"  IP:       {drive['ip']}")
+        
+        # Format services
+        services = ', '.join(drive['services'])
+        output.append(f"  Services: {BLUE}{services}{END}")
+    
+    return '\n'.join(output)
 
 def format_output(nas_drives):
-    """
-    Format the output of detected NAS drives
-    """
+    """Format NAS drive output for display."""
     output = []
     
-    if not nas_drives:
-        return "No NAS drives found."
+    # Sort drives: first mounted, then discovered
+    # Sort mounted drives by protocol, then server
+    mounted_drives = [d for d in nas_drives if d.get('mounted')]
+    discovered_drives = [d for d in nas_drives if not d.get('mounted')]
     
-    output.append("=" * 80)
-    output.append(f"NAS Drives Found: {len(nas_drives)}")
-    output.append("=" * 80)
+    # Sort mounted drives by protocol, then server
+    mounted_drives.sort(key=lambda d: (d['protocol'], d['server']))
     
-    # Group by type
-    mounted = [d for d in nas_drives if d['type'] == 'mounted']
-    discovered = [d for d in nas_drives if d['type'] == 'discovered']
+    # Sort discovered drives by IP address
+    discovered_drives.sort(key=lambda d: socket.inet_aton(d['ip']))
     
-    if mounted:
-        output.append("\nMOUNTED NAS DRIVES:")
-        output.append("-" * 80)
-        for i, drive in enumerate(mounted, 1):
-            output.append(format_single_drive(drive, i))
-            output.append("")
+    # Concatenate the sorted lists
+    sorted_drives = mounted_drives + discovered_drives
     
-    if discovered:
-        output.append("\nDISCOVERED NAS DEVICES (NOT MOUNTED):")
-        output.append("-" * 80)
-        for i, device in enumerate(discovered, 1):
-            output.append(format_single_drive(device, i))
-            output.append("")
+    # Format each drive
+    for i, drive in enumerate(sorted_drives, 1):
+        output.append(format_single_drive(drive))
+        output.append("")  # Add a blank line between entries
     
     return "\n".join(output)
 
@@ -758,189 +844,489 @@ def format_time(seconds):
         return f"{seconds}s"
 
 def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=True, sound_alert=False):
-    """
-    Main function to find and list NAS drives
-    """
-    start_time = time.time()
-    print("Scanning for NAS drives, please wait...\n")
+    """Find all NAS drives on the local network."""
+    print("Scanning for NAS drives...\n")
     
-    # Get mounted drives
-    print("Checking for mounted NAS drives...")
+    # First, find mounted network drives
     mounted_drives = get_mounted_nas_drives()
-    elapsed = time.time() - start_time
-    print(f"Found {len(mounted_drives)} mounted drives. Elapsed time: {format_time(elapsed)}\n")
     
-    # Display mounted drives progressively
     if mounted_drives:
-        print(("\033[1m" if use_color else "") + "MOUNTED NAS DRIVES:" + ("\033[0m" if use_color else ""))
-        print("-" * 80)
-        for i, drive in enumerate(mounted_drives, 1):
-            print(format_single_drive(drive, i, use_color))
+        print(f"Found {len(mounted_drives)} mounted drive(s):\n")
+        for drive in mounted_drives:
+            print(format_single_drive(drive, use_color=use_color))
             print()
+    else:
+        print("No mounted network drives found.\n")
     
-    # Get network info
+    # Next, scan the network for NAS devices
     print("Gathering network information...")
-    network_info = get_local_network_info()
     
-    # Networks to scan
-    networks_to_scan = []
-    for interface in network_info['interfaces']:
-        # Skip localhost and non-private networks
-        if interface['name'].startswith('lo') or not ipaddress.IPv4Address(interface['ip']).is_private:
-            continue
-        networks_to_scan.append(interface['network'])
+    # Get all available networks
+    networks = get_local_networks()
     
-    elapsed = time.time() - start_time
-    print(f"Found {len(networks_to_scan)} networks to scan. Elapsed time: {format_time(elapsed)}\n")
+    if not networks:
+        print("No networks found to scan.\n")
+        return
     
-    # Scan the networks for NAS devices
+    print(f"Found {len(networks)} network(s) to scan.\n")
+    
+    # Track IPs we've scanned to avoid duplicates
+    scanned_ips = set()
+    # Track all discovered devices
     discovered_devices = []
-    scanned_ips = set()  # Keep track of IPs we've already scanned
-    last_progress_update = time.time()
     
-    # Bold title with color if enabled
-    print(("\033[1m" if use_color else "") + "DISCOVERED NAS DEVICES (NOT MOUNTED):" + ("\033[0m" if use_color else ""))
-    print("-" * 80)
+    total_start_time = time.time()
+    total_hosts_scanned = 0
+    devices_found = len(mounted_drives)
     
-    # Set to keep track of IPs we've already displayed
-    displayed_ips = set()
+    # Display a banner when a new NAS is found
+    new_nas_banner = f"\n{'='*40}\n  🔍 NEW NAS DEVICE FOUND! 🔍\n{'='*40}\n" if use_color else "\n=== NEW NAS DEVICE FOUND ===\n"
     
-    # Advanced host discovery first to optimize scanning
-    print("Performing host discovery...")
+    # Function to play a sound notification when a NAS is found
+    def play_sound():
+        if sound_alert:
+            if is_macos():
+                subprocess.run(['afplay', '/System/Library/Sounds/Ping.aiff'], stderr=subprocess.DEVNULL)
+            elif is_linux():
+                subprocess.run(['paplay', '/usr/share/sounds/freedesktop/stereo/complete.oga'], stderr=subprocess.DEVNULL)
     
-    # Find active hosts across all networks first - much faster than scanning everything
-    total_hosts = 0
-    active_hosts_by_network = {}
-    
-    for network in networks_to_scan:
-        print(f"Discovering active hosts on {network}...")
-        active_hosts = find_active_hosts(network)
-        active_hosts_by_network[network] = active_hosts
-        total_hosts += len(active_hosts)
-    
-    # Sort hosts by likelihood of being NAS devices
-    all_hosts = []
-    for network, hosts in active_hosts_by_network.items():
-        all_hosts.extend(hosts)
-    
-    scan_start_time = time.time()
-    hosts_scanned = 0
-    devices_found = 0
-    
-    # Use a larger thread pool for scanning
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        # Submit jobs prioritizing likely NAS devices first
-        future_to_ip = {}
-        for host in all_hosts:
-            ip = host['ip']
-            # Skip already scanned IPs
+    # Process each network in the list
+    for network in networks:
+        net = ipaddress.IPv4Network(network)
+        print(f"Performing host discovery on {network}...")
+        hosts = discover_hosts(net, threads=threads)
+        
+        if not hosts:
+            print(f"No hosts found on {network}.\n")
+            continue
+        
+        print(f"Found {len(hosts)} host(s) on {network}.")
+        print(f"Scanning hosts for NAS services...")
+        
+        # Used to store already discovered IPs for this network to avoid duplicates
+        displayed_ips = set()
+        
+        # Keep track of progress
+        current_host = 0
+        total_hosts = len(hosts)
+        
+        # Function to scan a single host for NAS services
+        def scan_host(ip):
+            nonlocal current_host, total_hosts_scanned
+            
             if ip in scanned_ips:
-                continue
+                return None
             
             scanned_ips.add(ip)
-            future_to_ip[executor.submit(scan_for_nas, ip, DEFAULT_PORTS, timeout)] = ip
+            total_hosts_scanned += 1
+            current_host += 1
+            
+            # Print progress update
+            if current_host % 5 == 0 or current_host == total_hosts:
+                elapsed_time = time.time() - total_start_time
+                progress_msg = f"Progress: {current_host}/{total_hosts} hosts scanned ({total_hosts_scanned} total) | Elapsed: {elapsed_time:.1f}s"
+                print(progress_msg, end='\r', flush=True)
+            
+            # Scan the host for NAS services
+            result = scan_for_nas(ip, timeout=timeout)
+            return result
         
-        # Process results as they come in
-        for future in future_to_ip:
-            result = future.result()
-            hosts_scanned += 1
+        # Use ThreadPoolExecutor for parallel scanning
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            # Submit all jobs
+            future_results = [executor.submit(scan_host, str(ip)) for ip in hosts]
             
-            # Show progress every 5 seconds or after scanning 50 hosts
-            current_time = time.time()
-            if hosts_scanned % 50 == 0 or current_time - last_progress_update >= 3:
-                elapsed = current_time - start_time
-                scan_elapsed = current_time - scan_start_time
-                percent_complete = (hosts_scanned / total_hosts) * 100 if total_hosts > 0 else 0
-                scan_rate = hosts_scanned / scan_elapsed if scan_elapsed > 0 else 0
-                
-                # Estimate remaining time
-                if scan_rate > 0 and hosts_scanned < total_hosts:
-                    remaining_hosts = total_hosts - hosts_scanned
-                    remaining_seconds = remaining_hosts / scan_rate
-                    remaining_time = format_time(remaining_seconds)
-                else:
-                    remaining_time = "unknown"
-                
-                progress_msg = (
-                    f"Progress: {hosts_scanned}/{total_hosts} hosts scanned ({percent_complete:.1f}%), "
-                    f"Found {devices_found} NAS devices, "
-                    f"Elapsed: {format_time(elapsed)}, "
-                    f"Est. remaining: {remaining_time}"
-                )
-                
-                # Clear line and print progress
-                print("\r" + " " * 80, end="\r")  # Clear the line
-                print(f"\r{progress_msg}", end="", flush=True)
-                
-                last_progress_update = current_time
-            
-            if result:
-                discovered_devices.append(result)
-                
-                # Check if this IP is already in our mounted drives or displayed list
-                if (result['ip'] not in displayed_ips and 
-                    result['ip'] not in set(drive['server'] for drive in mounted_drives) and
-                    result['hostname'] not in set(drive['server'] for drive in mounted_drives)):
+            # Process results as they complete
+            for future in future_results:
+                try:
+                    result = future.result()
                     
-                    # Clear the progress line
-                    print("\r" + " " * 100)  # Clear the line with a newline and extra spaces
-                    
-                    # Play alert sound if enabled (ASCII bell character)
-                    if sound_alert:
-                        print('\a', end='', flush=True)
-                    
-                    
-                    # Print the new device with color highlighting
-                    devices_found += 1
-                    print(format_single_drive(result, devices_found, use_color))
-                    print()
-                    
-                    # Add to displayed set
-                    displayed_ips.add(result['ip'])
-                    
-                    # Print a separator
-                    if not use_color:
-                        print("-" * 80)
-                    
-                    # Restore progress display
-                    progress_msg = (
-                        f"Progress: {hosts_scanned}/{total_hosts} hosts scanned ({percent_complete:.1f}%), "
-                        f"Found {devices_found} NAS devices, "
-                        f"Elapsed: {format_time(elapsed)}, "
-                        f"Est. remaining: {remaining_time}"
-                    )
-                    print(f"\r{progress_msg}", end="", flush=True)
+                    # Skip non-NAS hosts
+                    if result is None:
+                        continue
+                        
+                    # Check if this is a new unique device
+                    if (result['ip'] not in displayed_ips and 
+                        result['ip'] not in set(drive['server'] for drive in mounted_drives) and
+                        result['name'] not in set(drive['server'] for drive in mounted_drives)):
+                        
+                        # Clear the progress line
+                        print(" " * 100, end="\r")
+                        
+                        # Add to the list of discovered devices
+                        discovered_devices.append(result)
+                        displayed_ips.add(result['ip'])
+                        
+                        # Display banner and play sound
+                        print(new_nas_banner)
+                        play_sound()
+                        
+                        # Print the new device with color highlighting
+                        devices_found += 1
+                        print(format_single_drive(result, use_color=use_color))
+                        print()
+                        
+                except Exception as e:
+                    print(f"Error processing scan result: {e}")
     
-    # Print a newline after the progress updates
-    print()
+    # Clear progress line
+    print(" " * 100, end="\r")
     
-    # Combine results and remove duplicates
-    all_drives = mounted_drives
+    # Print summary
+    total_time = time.time() - total_start_time
+    print(f"\nScan Summary:")
+    print(f"- Total hosts scanned: {total_hosts_scanned}")
+    print(f"- Total NAS devices found: {devices_found}")
+    print(f"- Total scan time: {total_time:.1f} seconds")
     
-    # Add discovered devices that aren't already mounted
-    mounted_ips = set(drive['server'] for drive in mounted_drives)
-    added_ips = set()  # To avoid duplicate discovered devices
+    # Combine mounted and discovered drives for easy reference
+    all_drives = mounted_drives.copy()
+    added_ips = set(drive['server'] for drive in mounted_drives)
     
     for device in discovered_devices:
-        if device['ip'] not in mounted_ips and device['hostname'] not in mounted_ips and device['ip'] not in added_ips:
+        if device['ip'] not in added_ips and device['name'] not in added_ips and device['ip'] not in added_ips:
             all_drives.append(device)
             added_ips.add(device['ip'])
     
-    # Calculate and print total elapsed time
-    total_elapsed = time.time() - start_time
-    
-    # Print summary with optional color
-    print("\n" + "=" * 80)
-    print(("\033[1m" if use_color else "") + "SCAN SUMMARY" + ("\033[0m" if use_color else ""))
-    print("=" * 80)
-    print(f"Total Hosts Scanned: {hosts_scanned}")
-    print(f"Total NAS Devices Found: {len(all_drives)}")
-    print(f"Mounted NAS Drives: {len(mounted_drives)}")
-    print(f"Discovered NAS Devices: {len(added_ips)}")
-    print(f"Total scan time: {format_time(total_elapsed)}")
-    print("=" * 80)
-    
     return all_drives
+
+def get_local_networks():
+    """Get a list of local networks to scan."""
+    networks = []
+    
+    try:
+        print("DEBUG: Detecting local networks...")
+        
+        # Get IP addresses from hostname
+        hostname = socket.gethostname()
+        ips = []
+        
+        try:
+            print(f"DEBUG: Getting IP for hostname: {hostname}")
+            ip = socket.gethostbyname(hostname)
+            if not ip.startswith('127.'):
+                ips.append(ip)
+                print(f"DEBUG: Found IP: {ip}")
+        except Exception as e:
+            print(f"DEBUG: Error getting hostname IP: {e}")
+        
+        # Try to get all IPs from socket
+        try:
+            print("DEBUG: Getting all IPs from socket.getaddrinfo")
+            addresses = socket.getaddrinfo(socket.gethostname(), None)
+            for addr in addresses:
+                ip = addr[4][0]
+                if not ip.startswith('127.') and ':' not in ip:  # Skip loopback and IPv6
+                    if ip not in ips:
+                        ips.append(ip)
+                        print(f"DEBUG: Found IP: {ip}")
+        except Exception as e:
+            print(f"DEBUG: Error getting all IPs: {e}")
+        
+        # Use ifconfig/ip command as fallback
+        try:
+            if is_macos():
+                print("DEBUG: Using ifconfig to get IPs")
+                output = subprocess.check_output(['ifconfig']).decode('utf-8')
+                # Find all inet addresses
+                for line in output.split('\n'):
+                    if 'inet ' in line and 'inet6' not in line and '127.0.0.1' not in line:
+                        parts = line.strip().split()
+                        for i, part in enumerate(parts):
+                            if part == 'inet' and i+1 < len(parts):
+                                ip = parts[i+1]
+                                if ip not in ips:
+                                    ips.append(ip)
+                                    print(f"DEBUG: Found IP from ifconfig: {ip}")
+            elif is_linux():
+                print("DEBUG: Using ip command to get IPs")
+                output = subprocess.check_output(['ip', '-4', 'addr', 'show']).decode('utf-8')
+                # Find all inet addresses
+                matches = re.findall(r'inet\s+(\d+\.\d+\.\d+\.\d+)', output)
+                for ip in matches:
+                    if not ip.startswith('127.') and ip not in ips:
+                        ips.append(ip)
+                        print(f"DEBUG: Found IP from ip command: {ip}")
+        except Exception as e:
+            print(f"DEBUG: Error using ifconfig/ip command: {e}")
+        
+        # Convert IPs to networks
+        for ip in ips:
+            try:
+                if ipaddress.IPv4Address(ip).is_private:
+                    # Assume a /24 network
+                    network = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+                    if str(network) not in networks:
+                        networks.append(str(network))
+                        print(f"DEBUG: Added network: {network}")
+            except Exception as e:
+                print(f"DEBUG: Error processing IP {ip}: {e}")
+        
+    except Exception as e:
+        logger.error(f"Error getting local networks: {e}")
+        print(f"DEBUG: Exception in get_local_networks: {str(e)}")
+        import traceback
+        print(f"DEBUG: {traceback.format_exc()}")
+    
+    print(f"DEBUG: Returning networks: {networks}")
+    return networks
+
+def discover_hosts(network, threads=DEFAULT_THREADS):
+    """
+    Discover active hosts on a network using various methods.
+    Returns a list of active host IPs.
+    """
+    hosts = []
+    
+    try:
+        # Use ARP scan for host discovery (faster than ping sweep)
+        if is_macos():
+            # On macOS use arp-scan if available, otherwise ping sweep
+            try:
+                output = subprocess.check_output(['arp', '-a'], stderr=subprocess.DEVNULL).decode('utf-8')
+                
+                # Parse arp -a output
+                for line in output.splitlines():
+                    if '(' in line and ')' in line:
+                        ip = line.split('(')[1].split(')')[0]
+                        try:
+                            if (ipaddress.IPv4Address(ip).is_private and
+                                ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(network)):
+                                hosts.append(ip)
+                        except:
+                            continue
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # Fallback to ping sweep
+                hosts = ping_sweep(network, threads)
+        elif is_linux():
+            # On Linux use arp-scan if available
+            try:
+                output = subprocess.check_output(['arp-scan', '--localnet'], stderr=subprocess.DEVNULL).decode('utf-8')
+                
+                # Parse arp-scan output
+                for line in output.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            ip = parts[0]
+                            if (ipaddress.IPv4Address(ip).is_private and
+                                ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(network)):
+                                hosts.append(ip)
+                        except:
+                            continue
+            except (subprocess.SubprocessError, FileNotFoundError):
+                # Fallback to ip neighbor
+                try:
+                    output = subprocess.check_output(['ip', 'neighbor'], stderr=subprocess.DEVNULL).decode('utf-8')
+                    
+                    # Parse ip neighbor output
+                    for line in output.splitlines():
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            try:
+                                ip = parts[0]
+                                if (ipaddress.IPv4Address(ip).is_private and
+                                    ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(network)):
+                                    hosts.append(ip)
+                            except:
+                                continue
+                except:
+                    # Final fallback to ping sweep
+                    hosts = ping_sweep(network, threads)
+    except Exception as e:
+        logger.error(f"Error discovering hosts: {e}")
+        # Fallback to ping sweep
+        hosts = ping_sweep(network, threads)
+    
+    # If we found no hosts, try a ping sweep
+    if not hosts:
+        hosts = ping_sweep(network, threads)
+    
+    return hosts
+
+def ping_sweep(network, threads=DEFAULT_THREADS):
+    """Perform a ping sweep to find active hosts on a network."""
+    net = ipaddress.IPv4Network(network)
+    active_hosts = []
+    
+    # Function to ping a single host
+    def ping_host(ip):
+        ip_str = str(ip)
+        
+        # Use different ping command formats based on OS
+        if is_macos():
+            cmd = ['ping', '-c', '1', '-W', '100', '-t', '1', ip_str]
+        else:  # Linux
+            cmd = ['ping', '-c', '1', '-W', '1', ip_str]
+            
+        try:
+            subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            return ip_str
+        except:
+            return None
+    
+    # Use ThreadPoolExecutor for parallel pinging
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        # Submit all jobs
+        future_results = {executor.submit(ping_host, ip): ip for ip in net.hosts()}
+        
+        # Process results as they complete
+        for future in future_results:
+            result = future.result()
+            if result:
+                active_hosts.append(result)
+    
+    return active_hosts
+
+def find_mounted_drives():
+    """Find mounted network drives on the system."""
+    mounted_drives = []
+    
+    try:
+        if is_macos():
+            # On macOS, use mount command
+            output = subprocess.check_output(['mount']).decode('utf-8')
+            
+            # Look for AFP, SMB, NFS mounts
+            for line in output.splitlines():
+                mount_info = {}
+                
+                if 'afp://' in line:
+                    # AFP mount
+                    server_share = line.split('afp://')[1].split(' ')[0]
+                    mount_point = line.split(' on ')[1].split(' (')[0]
+                    
+                    # Split server and share
+                    if '/' in server_share:
+                        server = server_share.split('/')[0]
+                        share = '/'.join(server_share.split('/')[1:])
+                    else:
+                        server = server_share
+                        share = '/'
+                    
+                    mount_info = {
+                        'protocol': 'AFP',
+                        'server': server,
+                        'share': share,
+                        'mountpoint': mount_point,
+                        'mounted': True
+                    }
+                    
+                elif 'smb://' in line or ('//SMBFS' in line and '@' in line):
+                    # SMB mount
+                    if 'smb://' in line:
+                        server_share = line.split('smb://')[1].split(' ')[0]
+                    else:
+                        # Parse //SMBFS style mounts (older macOS)
+                        server_share_part = line.split('//')[1].split(' ')[0]
+                        if '@' in server_share_part:
+                            user, server_share = server_share_part.split('@', 1)
+                        else:
+                            server_share = server_share_part
+                    
+                    mount_point = line.split(' on ')[1].split(' (')[0]
+                    
+                    # Split server and share
+                    if '/' in server_share:
+                        server = server_share.split('/')[0]
+                        share = '/'.join(server_share.split('/')[1:])
+                    else:
+                        server = server_share
+                        share = '/'
+                    
+                    mount_info = {
+                        'protocol': 'SMB',
+                        'server': server,
+                        'share': share,
+                        'mountpoint': mount_point,
+                        'mounted': True
+                    }
+                    
+                elif ' nfs ' in line or ' nfs, ' in line:
+                    # NFS mount
+                    server_share = line.split(' from ')[1].split(' ')[0]
+                    mount_point = line.split(' on ')[1].split(' ')[0]
+                    
+                    # Split server and share
+                    if ':' in server_share:
+                        server, share = server_share.split(':', 1)
+                    else:
+                        server = server_share
+                        share = '/'
+                    
+                    mount_info = {
+                        'protocol': 'NFS',
+                        'server': server,
+                        'share': share,
+                        'mountpoint': mount_point,
+                        'mounted': True
+                    }
+                
+                # Add the mount if we found one
+                if mount_info:
+                    mounted_drives.append(mount_info)
+                    
+        elif is_linux():
+            # On Linux, check /proc/mounts and parse mount command
+            output = subprocess.check_output(['mount']).decode('utf-8')
+            
+            # Look for cifs (SMB), nfs mounts
+            for line in output.splitlines():
+                mount_info = {}
+                
+                if ' cifs ' in line or ' cifs, ' in line or ' smb ' in line:
+                    # SMB/CIFS mount
+                    parts = line.split(' ')
+                    source = parts[0]
+                    mount_point = parts[2]
+                    
+                    # Parse server and share from something like //server/share
+                    if source.startswith('//'):
+                        server_share = source[2:]  # Remove leading //
+                        if '/' in server_share:
+                            server = server_share.split('/')[0]
+                            share = '/'.join(server_share.split('/')[1:])
+                        else:
+                            server = server_share
+                            share = '/'
+                        
+                        mount_info = {
+                            'protocol': 'SMB',
+                            'server': server,
+                            'share': share,
+                            'mountpoint': mount_point,
+                            'mounted': True
+                        }
+                    
+                elif ' nfs ' in line or ' nfs, ' in line or ' nfs4 ' in line:
+                    # NFS mount
+                    parts = line.split(' ')
+                    source = parts[0]
+                    mount_point = parts[2]
+                    
+                    # Parse server and share from something like server:/share
+                    if ':' in source:
+                        server, share = source.split(':', 1)
+                    else:
+                        server = source
+                        share = '/'
+                    
+                    mount_info = {
+                        'protocol': 'NFS',
+                        'server': server,
+                        'share': share,
+                        'mountpoint': mount_point,
+                        'mounted': True
+                    }
+                
+                # Add the mount if we found one
+                if mount_info:
+                    mounted_drives.append(mount_info)
+    
+    except Exception as e:
+        logger.error(f"Error finding mounted drives: {e}")
+    
+    return mounted_drives
 
 if __name__ == "__main__":
     # Parse command line arguments
@@ -953,7 +1339,14 @@ if __name__ == "__main__":
                         help='Disable colored output')
     parser.add_argument('--sound', action='store_true',
                         help='Play a sound alert when a new NAS device is found')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable debug logging for name resolution')
+                        
     args = parser.parse_args()
     
+    # Enable debug logging if requested
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        
     # Run the scan
     find_nas_drives(threads=args.threads, timeout=args.timeout, use_color=not args.no_color, sound_alert=args.sound) 
