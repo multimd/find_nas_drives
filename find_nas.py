@@ -788,14 +788,11 @@ def format_single_drive(drive, use_color=True):
         name_source = drive.get('name_source', 'Unknown')
         
         if device_name != drive['ip']:
-            if name_source != "IP":
-                # We have a real device name
-                output.append(f"  Name:     {CYAN}{device_name}{END} ({name_source})")
-            else:
-                # Just IP address
-                output.append(f"  IP:       {drive['ip']}")
+            # Always show both name and IP address
+            output.append(f"  Name:     {CYAN}{device_name}{END} ({name_source})")
+            output.append(f"  IP:       {drive['ip']}")
         else:
-            # Just IP address
+            # Just IP address (no name was found)
             output.append(f"  IP:       {drive['ip']}")
         
         # Format services
@@ -845,29 +842,46 @@ def format_time(seconds):
 
 def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=True, sound_alert=False):
     """Find all NAS drives on the local network."""
+    total_start_time = time.time()
+    
     print("Scanning for NAS drives...\n")
     
+    # Display initial elapsed time
+    def display_elapsed():
+        elapsed = time.time() - total_start_time
+        print(f"Elapsed time: {format_time(elapsed)}", end="\r", flush=True)
+    
     # First, find mounted network drives
+    display_elapsed()
     mounted_drives = get_mounted_nas_drives()
     
     if mounted_drives:
+        # Clear the elapsed time line
+        print(" " * 30, end="\r")
         print(f"Found {len(mounted_drives)} mounted drive(s):\n")
         for drive in mounted_drives:
             print(format_single_drive(drive, use_color=use_color))
             print()
     else:
+        # Clear the elapsed time line
+        print(" " * 30, end="\r")
         print("No mounted network drives found.\n")
     
     # Next, scan the network for NAS devices
+    display_elapsed()
     print("Gathering network information...")
     
     # Get all available networks
     networks = get_local_networks()
     
     if not networks:
+        # Clear the elapsed time line
+        print(" " * 30, end="\r")
         print("No networks found to scan.\n")
         return
     
+    # Clear the elapsed time line
+    print(" " * 30, end="\r")
     print(f"Found {len(networks)} network(s) to scan.\n")
     
     # Track IPs we've scanned to avoid duplicates
@@ -875,12 +889,8 @@ def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=
     # Track all discovered devices
     discovered_devices = []
     
-    total_start_time = time.time()
     total_hosts_scanned = 0
     devices_found = len(mounted_drives)
-    
-    # Display a banner when a new NAS is found
-    new_nas_banner = f"\n{'='*40}\n  🔍 NEW NAS DEVICE FOUND! 🔍\n{'='*40}\n" if use_color else "\n=== NEW NAS DEVICE FOUND ===\n"
     
     # Function to play a sound notification when a NAS is found
     def play_sound():
@@ -893,13 +903,18 @@ def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=
     # Process each network in the list
     for network in networks:
         net = ipaddress.IPv4Network(network)
+        display_elapsed()
         print(f"Performing host discovery on {network}...")
         hosts = discover_hosts(net, threads=threads)
         
         if not hosts:
+            # Clear the elapsed time line
+            print(" " * 30, end="\r")
             print(f"No hosts found on {network}.\n")
             continue
         
+        # Clear the elapsed time line
+        print(" " * 30, end="\r")
         print(f"Found {len(hosts)} host(s) on {network}.")
         print(f"Scanning hosts for NAS services...")
         
@@ -921,10 +936,10 @@ def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=
             total_hosts_scanned += 1
             current_host += 1
             
-            # Print progress update
+            # Print progress update with elapsed time
             if current_host % 5 == 0 or current_host == total_hosts:
                 elapsed_time = time.time() - total_start_time
-                progress_msg = f"Progress: {current_host}/{total_hosts} hosts scanned ({total_hosts_scanned} total) | Elapsed: {elapsed_time:.1f}s"
+                progress_msg = f"Progress: {current_host}/{total_hosts} hosts scanned ({total_hosts_scanned} total) | Elapsed: {format_time(elapsed_time)}"
                 print(progress_msg, end='\r', flush=True)
             
             # Scan the host for NAS services
@@ -957,14 +972,18 @@ def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=
                         discovered_devices.append(result)
                         displayed_ips.add(result['ip'])
                         
-                        # Display banner and play sound
-                        print(new_nas_banner)
+                        # Play sound
                         play_sound()
                         
                         # Print the new device with color highlighting
                         devices_found += 1
                         print(format_single_drive(result, use_color=use_color))
                         print()
+                        
+                        # Show updated elapsed time after printing device
+                        elapsed_time = time.time() - total_start_time
+                        progress_msg = f"Progress: {current_host}/{total_hosts} hosts scanned ({total_hosts_scanned} total) | Elapsed: {format_time(elapsed_time)}"
+                        print(progress_msg, end='\r', flush=True)
                         
                 except Exception as e:
                     print(f"Error processing scan result: {e}")
@@ -977,7 +996,7 @@ def find_nas_drives(threads=DEFAULT_THREADS, timeout=DEFAULT_TIMEOUT, use_color=
     print(f"\nScan Summary:")
     print(f"- Total hosts scanned: {total_hosts_scanned}")
     print(f"- Total NAS devices found: {devices_found}")
-    print(f"- Total scan time: {total_time:.1f} seconds")
+    print(f"- Total scan time: {format_time(total_time)}")
     
     # Combine mounted and discovered drives for easy reference
     all_drives = mounted_drives.copy()
