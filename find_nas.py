@@ -1231,27 +1231,34 @@ def find_mounted_drives():
                         'mounted': True
                     }
                     
-                elif 'smb://' in line or ('//SMBFS' in line and '@' in line):
+                # Enhanced SMB detection logic to handle more formats
+                elif 'smb://' in line or 'smbfs' in line or ('//' in line and '@' in line):
                     # SMB mount
                     if 'smb://' in line:
                         server_share = line.split('smb://')[1].split(' ')[0]
+                        mount_point = line.split(' on ')[1].split(' (')[0]
                     else:
-                        # Parse //SMBFS style mounts (older macOS)
-                        server_share_part = line.split('//')[1].split(' ')[0]
+                        # Handle //username@server/share format
+                        server_share_part = line.split('//')[1].split(' on ')[0]
+                        mount_point = line.split(' on ')[1].split(' (')[0]
+                        
+                        # Handle username in the server part
                         if '@' in server_share_part:
-                            user, server_share = server_share_part.split('@', 1)
+                            username, server_share = server_share_part.split('@', 1)
                         else:
                             server_share = server_share_part
                     
-                    mount_point = line.split(' on ')[1].split(' (')[0]
-                    
-                    # Split server and share
+                    # Clean up server name (remove _smb._tcp.local suffix if present)
                     if '/' in server_share:
                         server = server_share.split('/')[0]
                         share = '/'.join(server_share.split('/')[1:])
                     else:
                         server = server_share
                         share = '/'
+                        
+                    # Remove ._smb._tcp.local suffix if present
+                    if '._smb._tcp.local' in server:
+                        server = server.replace('._smb._tcp.local', '')
                     
                     mount_info = {
                         'protocol': 'SMB',
@@ -1286,64 +1293,165 @@ def find_mounted_drives():
                     mounted_drives.append(mount_info)
                     
         elif is_linux():
-            # On Linux, check /proc/mounts and parse mount command
+            # On Linux, check both mount command and /proc/mounts
             output = subprocess.check_output(['mount']).decode('utf-8')
             
-            # Look for cifs (SMB), nfs mounts
+            # Add debug output to see what we're working with
+            print("DEBUG: Mount output:")
+            for line in output.splitlines():
+                if "cifs" in line or "nfs" in line or "smb" in line:
+                    print(f"DEBUG: Found network mount: {line}")
+            
+            # Look for cifs (SMB), nfs mounts with more flexible parsing
             for line in output.splitlines():
                 mount_info = {}
                 
-                if ' cifs ' in line or ' cifs, ' in line or ' smb ' in line:
-                    # SMB/CIFS mount
-                    parts = line.split(' ')
-                    source = parts[0]
-                    mount_point = parts[2]
-                    
-                    # Parse server and share from something like //server/share
-                    if source.startswith('//'):
-                        server_share = source[2:]  # Remove leading //
-                        if '/' in server_share:
-                            server = server_share.split('/')[0]
-                            share = '/'.join(server_share.split('/')[1:])
+                # More flexible check for SMB/CIFS mounts
+                if 'type cifs' in line or 'cifs,' in line or 'smb' in line:
+                    try:
+                        # Try to extract source and mountpoint with more flexible parsing
+                        parts = line.split(' on ' if ' on ' in line else ' ')
+                        source = parts[0]
+                        # Get mount point (different format handling)
+                        if ' on ' in line:
+                            mount_point = line.split(' on ')[1].split(' ')[0]
                         else:
-                            server = server_share
+                            # Try to find the mount point in the parts
+                            mount_point = None
+                            for i, part in enumerate(parts):
+                                if part == 'on' and i+1 < len(parts):
+                                    mount_point = parts[i+1]
+                                    break
+                            
+                            # If we still couldn't find it, try a different approach
+                            if not mount_point:
+                                mount_point = parts[2]
+                        
+                        # Parse server and share from something like //server/share
+                        if '//' in source:
+                            server_share = source.split('//')[1]
+                            if '/' in server_share:
+                                server = server_share.split('/')[0]
+                                share = '/'.join(server_share.split('/')[1:])
+                            else:
+                                server = server_share
+                                share = '/'
+                            
+                            mount_info = {
+                                'protocol': 'SMB',
+                                'server': server,
+                                'share': share,
+                                'mountpoint': mount_point,
+                                'mounted': True
+                            }
+                    except Exception as e:
+                        print(f"DEBUG: Error parsing SMB mount: {e} | Line: {line}")
+                
+                # More flexible check for NFS mounts
+                elif 'type nfs' in line or 'nfs,' in line or 'nfs4' in line:
+                    try:
+                        # Try to extract source and mountpoint with more flexible parsing
+                        parts = line.split(' on ' if ' on ' in line else ' ')
+                        source = parts[0]
+                        # Get mount point (different format handling)
+                        if ' on ' in line:
+                            mount_point = line.split(' on ')[1].split(' ')[0]
+                        else:
+                            # Try to find the mount point in the parts
+                            mount_point = None
+                            for i, part in enumerate(parts):
+                                if part == 'on' and i+1 < len(parts):
+                                    mount_point = parts[i+1]
+                                    break
+                            
+                            # If we still couldn't find it, try a different approach
+                            if not mount_point:
+                                mount_point = parts[2]
+                        
+                        # Parse server and share from something like server:/share
+                        if ':' in source:
+                            server, share = source.split(':', 1)
+                        else:
+                            server = source
                             share = '/'
                         
                         mount_info = {
-                            'protocol': 'SMB',
+                            'protocol': 'NFS',
                             'server': server,
                             'share': share,
                             'mountpoint': mount_point,
                             'mounted': True
                         }
-                    
-                elif ' nfs ' in line or ' nfs, ' in line or ' nfs4 ' in line:
-                    # NFS mount
-                    parts = line.split(' ')
-                    source = parts[0]
-                    mount_point = parts[2]
-                    
-                    # Parse server and share from something like server:/share
-                    if ':' in source:
-                        server, share = source.split(':', 1)
-                    else:
-                        server = source
-                        share = '/'
-                    
-                    mount_info = {
-                        'protocol': 'NFS',
-                        'server': server,
-                        'share': share,
-                        'mountpoint': mount_point,
-                        'mounted': True
-                    }
+                    except Exception as e:
+                        print(f"DEBUG: Error parsing NFS mount: {e} | Line: {line}")
                 
                 # Add the mount if we found one
                 if mount_info:
                     mounted_drives.append(mount_info)
+                    print(f"DEBUG: Added mounted drive: {mount_info}")
+            
+            # If we didn't find any mounts, try checking /proc/mounts directly
+            if not mounted_drives:
+                try:
+                    with open('/proc/mounts', 'r') as f:
+                        mounts_content = f.read()
+                    
+                    print("DEBUG: /proc/mounts content for network shares:")
+                    for line in mounts_content.splitlines():
+                        if "cifs" in line or "nfs" in line:
+                            print(f"DEBUG: {line}")
+                    
+                    for line in mounts_content.splitlines():
+                        if "cifs" in line:
+                            parts = line.split()
+                            source = parts[0]
+                            mount_point = parts[1]
+                            
+                            # Check for SMB/CIFS format
+                            if '//' in source:
+                                server_share = source.split('//')[1]
+                                if '/' in server_share:
+                                    server = server_share.split('/')[0]
+                                    share = '/'.join(server_share.split('/')[1:])
+                                else:
+                                    server = server_share
+                                    share = '/'
+                                
+                                mounted_drives.append({
+                                    'protocol': 'SMB',
+                                    'server': server,
+                                    'share': share,
+                                    'mountpoint': mount_point,
+                                    'mounted': True
+                                })
+                                print(f"DEBUG: Added SMB mount from /proc/mounts: {server}:{share}")
+                        
+                        elif "nfs" in line:
+                            parts = line.split()
+                            source = parts[0]
+                            mount_point = parts[1]
+                            
+                            # Check for NFS format
+                            if ':' in source:
+                                server, share = source.split(':', 1)
+                            else:
+                                server = source
+                                share = '/'
+                            
+                            mounted_drives.append({
+                                'protocol': 'NFS',
+                                'server': server,
+                                'share': share,
+                                'mountpoint': mount_point,
+                                'mounted': True
+                            })
+                            print(f"DEBUG: Added NFS mount from /proc/mounts: {server}:{share}")
+                except Exception as e:
+                    print(f"DEBUG: Error checking /proc/mounts: {e}")
     
     except Exception as e:
         logger.error(f"Error finding mounted drives: {e}")
+        print(f"DEBUG: Exception in find_mounted_drives: {str(e)}")
     
     return mounted_drives
 
